@@ -74,9 +74,11 @@ import dev.coinutxo.logic.AmountParser
 import dev.coinutxo.logic.AmountUnit
 import dev.coinutxo.logic.FeeMath
 import dev.coinutxo.logic.FeeQuote
+import dev.coinutxo.logic.NetworkDefaults
 import dev.coinutxo.logic.UtxoRef
 import dev.coinutxo.wallet.CoinUtxoApplication
 import dev.coinutxo.wallet.data.WalletMeta
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -128,6 +130,15 @@ fun WalletScreen(nav: NavHostController, id: String) {
         ) {
             Text("${networkLabel(meta.network)} · ${kindLabel(meta.kind)}")
             Text(snapshot?.balanceSats?.let(::formatSats) ?: "잔액을 불러오는 중", style = MaterialTheme.typography.titleLarge)
+            if (model.busy && snapshot != null) {
+                Text(
+                    if (meta.network == NetworkDefaults.BITCOIN) {
+                        "받기 주소는 바로 쓸 수 있습니다. 메인넷은 처음 잔액을 맞출 때만 오래 걸립니다."
+                    } else {
+                        "받기 주소는 바로 쓸 수 있습니다. 잔액은 체인과 맞추는 중입니다."
+                    },
+                )
+            }
             if (snapshot != null && snapshot.tipHeight > 0) {
                 Text("팁 높이 ${snapshot.tipHeight}")
             }
@@ -252,18 +263,17 @@ class WalletViewModel(app: Application, private val walletId: String) : AndroidV
     fun open() {
         meta = repository().wallet(walletId)
         if (meta == null || busy) return
+        busy = true
         viewModelScope.launch {
-            busy = true
             error = null
             try {
-                val local = repository().localSnapshot(walletId)
-                if (local.utxos.isNotEmpty() || local.balanceSats > 0L) {
-                    snapshot = local
-                }
+                snapshot = repository().localSnapshot(walletId)
                 val synced = repository().sync(walletId)
                 snapshot = synced
                 meta = repository().wallet(walletId)
                 selected = selected.intersect(synced.utxos.map { it.id }.toSet())
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 error = safeError(e)
             } finally {
