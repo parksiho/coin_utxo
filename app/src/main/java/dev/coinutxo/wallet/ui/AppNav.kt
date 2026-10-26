@@ -1,6 +1,7 @@
 package dev.coinutxo.wallet.ui
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -17,12 +18,12 @@ fun AppNav(nav: NavHostController) {
         composable("home") { HomeScreen(nav) }
         composable("settings") { SettingsScreen(nav) }
         navigation(startDestination = "create/backup", route = "create") {
-            composable("create/backup") {
-                val owner = nav.getBackStackEntry("create")
+            composable("create/backup") { entry ->
+                val owner = remember(entry) { nav.getBackStackEntry("create") }
                 CreateBackupScreen(nav, viewModel(owner))
             }
-            composable("create/confirm") {
-                val owner = nav.getBackStackEntry("create")
+            composable("create/confirm") { entry ->
+                val owner = remember(entry) { nav.getBackStackEntry("create") }
                 CreateConfirmScreen(nav, viewModel(owner))
             }
         }

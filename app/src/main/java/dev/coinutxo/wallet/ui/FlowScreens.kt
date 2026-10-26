@@ -3,6 +3,8 @@ package dev.coinutxo.wallet.ui
 import android.app.Application
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -25,16 +27,22 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
@@ -48,6 +56,14 @@ private fun AndroidViewModel.repo() = getApplication<CoinUtxoApplication>().repo
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(nav: NavHostController, model: HomeViewModel = viewModel()) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, model) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) model.refresh()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     val state = model.state
     LaunchedEffect(Unit) { model.refresh() }
     Scaffold(topBar = { TopAppBar(title = { Text("코인 UTXO") }, actions = {
@@ -57,7 +73,7 @@ fun HomeScreen(nav: NavHostController, model: HomeViewModel = viewModel()) {
             Modifier.fillMaxSize().padding(padding).padding(16.dp).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("감사를 받지 않은 소프트웨어입니다. 기본 네트워크는 시그넷이며, 메인넷은 설정에서만 켤 수 있습니다.", style = MaterialTheme.typography.bodyMedium)
+            Text("감사를 받지 않은 소프트웨어입니다. 기본 네트워크는 BTC 시그넷이며, BTC는 설정에서만 켤 수 있습니다.", style = MaterialTheme.typography.bodyMedium)
             Text("현재 네트워크: ${networkLabel(state.network)}", style = MaterialTheme.typography.titleMedium)
             Button(onClick = { nav.navigate("create/backup") }, modifier = Modifier.fillMaxWidth()) { Text("새 지갑 만들기") }
             OutlinedButton(onClick = { nav.navigate("import") }, modifier = Modifier.fillMaxWidth()) { Text("개인키 가져오기") }
@@ -68,9 +84,26 @@ fun HomeScreen(nav: NavHostController, model: HomeViewModel = viewModel()) {
             state.wallets.forEach { wallet ->
                 Card(onClick = { nav.navigate("wallet/${wallet.id}") }, modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(wallet.name, style = MaterialTheme.typography.titleMedium)
-                        Text("${networkLabel(wallet.network)} · ${kindLabel(wallet.kind)}")
-                        Text(wallet.lastBalanceSats?.let(::formatSats) ?: "아직 동기화하지 않음")
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                wallet.name,
+                                style = MaterialTheme.typography.titleMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                "${networkLabel(model.chainOf(wallet.network))} · ${kindLabel(wallet.kind)}",
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                            model.balanceOf(wallet)?.let { AmountText(it, ticker = amountTicker(model.chainOf(wallet.network))) } ?: Text("아직 동기화하지 않음")
+                        }
                     }
                 }
             }
@@ -86,11 +119,15 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         val repository = repo()
         state = HomeState(repository.currentNetwork(), repository.wallets())
     }
+
+    fun chainOf(stored: String) = repo().operatingNetwork(stored)
+
+    fun balanceOf(wallet: WalletMeta) = repo().balanceOnActiveChain(wallet)
 }
 
 data class HomeState(val network: String, val wallets: List<WalletMeta>)
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(nav: NavHostController, model: SettingsViewModel = viewModel()) {
     val state = model.state
@@ -101,11 +138,12 @@ fun SettingsScreen(nav: NavHostController, model: SettingsViewModel = viewModel(
         Column(Modifier.fillMaxSize().padding(padding).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("이 앱은 감사를 받지 않았습니다. 복구 문구를 잃어버리면 코인을 되찾을 수 없습니다.")
             Text("네트워크", style = MaterialTheme.typography.titleMedium)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { model.useSignet() }, enabled = state.network != NetworkDefaults.SIGNET) { Text("시그넷") }
-                Button(onClick = { model.askMainnet() }, enabled = state.network != NetworkDefaults.BITCOIN) { Text("메인넷") }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { model.useSignet() }, enabled = state.network != NetworkDefaults.SIGNET) { Text("BTC 시그넷") }
+                Button(onClick = { model.askMainnet() }, enabled = state.network != NetworkDefaults.BITCOIN) { Text("BTC") }
+                Button(onClick = { model.askMobick() }, enabled = state.network != NetworkDefaults.BTCMOBICK) { Text("BTCMobick") }
             }
-            Text("사용 중: ${networkLabel(state.network)}. 이미 만든 지갑의 네트워크는 바뀌지 않습니다.")
+            Text("사용 중: ${networkLabel(state.network)}. BTC와 BTCMobick은 주소가 같아서, 지금 고른 장부에서 그 주소들을 봅니다.")
             OutlinedTextField(
                 value = url,
                 onValueChange = { url = it },
@@ -121,12 +159,23 @@ fun SettingsScreen(nav: NavHostController, model: SettingsViewModel = viewModel(
     if (state.confirmMainnet) {
         AlertDialog(
             onDismissRequest = { model.dismissMainnet() },
-            title = { Text("메인넷을 사용할까요?") },
+            title = { Text("BTC를 사용할까요?") },
             text = {
-                Text("메인넷은 실제 비트코인입니다. 이 소프트웨어는 감사를 받지 않았으며, 잘못된 거래로 코인을 잃을 수 있습니다. 개발자는 그 손실에 책임지지 않습니다. 복구 문구를 오프라인에 적고, 잃어도 되는 금액만 사용하세요. 탐색 서버도 메인넷 기본값으로 바뀝니다.")
+                Text("BTC는 실제 비트코인입니다. 이 소프트웨어는 감사를 받지 않았으며, 잘못된 거래로 코인을 잃을 수 있습니다. 개발자는 그 손실에 책임지지 않습니다. 복구 문구를 오프라인에 적고, 잃어도 되는 금액만 사용하세요. 탐색 서버도 BTC 기본값으로 바뀝니다.")
             },
-            confirmButton = { TextButton(onClick = { model.confirmMainnet() }) { Text("메인넷 사용") } },
+            confirmButton = { TextButton(onClick = { model.confirmMainnet() }) { Text("BTC 사용") } },
             dismissButton = { TextButton(onClick = { model.dismissMainnet() }) { Text("취소") } },
+        )
+    }
+    if (state.confirmMobick) {
+        AlertDialog(
+            onDismissRequest = { model.dismissMobick() },
+            title = { Text("BTCMobick 메인넷을 사용할까요?") },
+            text = {
+                Text("BTCMobick은 비트코인에서 갈라진 실제 메인넷이며 단위는 BMB입니다. 주소 형식은 비트코인과 같지만 장부는 다릅니다. 이 소프트웨어는 감사를 받지 않았습니다. 복구 문구를 오프라인에 적고, 잃어도 되는 금액만 사용하세요. 탐색 서버는 blockchain.mobick.info로 바뀝니다.")
+            },
+            confirmButton = { TextButton(onClick = { model.confirmMobick() }) { Text("BTCMobick 사용") } },
+            dismissButton = { TextButton(onClick = { model.dismissMobick() }) { Text("취소") } },
         )
     }
 }
@@ -145,12 +194,25 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
 
     fun confirmMainnet() {
         repo().setNetwork(NetworkDefaults.BITCOIN)
-        state = read().copy(message = "메인넷으로 바꿨습니다.")
+        state = read().copy(message = "BTC로 바꿨습니다.")
+    }
+
+    fun askMobick() {
+        state = state.copy(confirmMobick = true, error = null, message = null)
+    }
+
+    fun dismissMobick() {
+        state = state.copy(confirmMobick = false)
+    }
+
+    fun confirmMobick() {
+        repo().setNetwork(NetworkDefaults.BTCMOBICK)
+        state = read().copy(message = "BTCMobick 메인넷으로 바꿨습니다.")
     }
 
     fun useSignet() {
         repo().setNetwork(NetworkDefaults.SIGNET)
-        state = read().copy(message = "시그넷으로 바꿨습니다.")
+        state = read().copy(message = "BTC 시그넷으로 바꿨습니다.")
     }
 
     fun saveEsplora(url: String) {
@@ -164,7 +226,7 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun read(): SettingsState {
         val repository = repo()
-        return SettingsState(repository.currentNetwork(), repository.esploraUrl(), false, null, null)
+        return SettingsState(repository.currentNetwork(), repository.esploraUrl(), false, false, null, null)
     }
 }
 
@@ -172,6 +234,7 @@ data class SettingsState(
     val network: String,
     val esplora: String,
     val confirmMainnet: Boolean,
+    val confirmMobick: Boolean,
     val message: String?,
     val error: String?,
 )

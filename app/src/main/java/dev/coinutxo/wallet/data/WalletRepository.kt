@@ -10,16 +10,19 @@ import dev.coinutxo.bdk.BdkUserException
 import dev.coinutxo.bdk.PublicDescriptors
 import dev.coinutxo.bdk.SendDraft
 import dev.coinutxo.bdk.SyncSnapshot
+import dev.coinutxo.logic.BdkWorkers
 import dev.coinutxo.logic.NetworkDefaults
 import dev.coinutxo.logic.UtxoRef
-import kotlinx.coroutines.CoroutineDispatcher
-import kotlinx.coroutines.asCoroutineDispatcher
+import dev.coinutxo.logic.WalletName
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.UUID
-import java.util.concurrent.Executors
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeoutException
 
 data class WalletMeta(
     val id: String,
@@ -30,6 +33,7 @@ data class WalletMeta(
     val internalDescriptor: String?,
     val createdAt: Long,
     val lastBalanceSats: Long?,
+    val balanceNetwork: String? = null,
 )
 
 data class StoredSecret(val kind: String, val value: String)
@@ -39,10 +43,10 @@ class WalletRepository(context: Context) {
     private val metas = MetaStore(appContext)
     private val settings = SettingsStore(appContext)
     private val secrets = SecretStore(appContext)
-    private val dispatcher: CoroutineDispatcher = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "bdk").apply { isDaemon = true }
-    }.asCoroutineDispatcher()
-    private val sessions = HashMap<String, BdkSession>()
+    private val workers = BdkWorkers()
+    private val sessions = ConcurrentHashMap<String, BdkSession>()
+    private val scanning = ConcurrentHashMap.newKeySet<String>()
+    private val removed = ConcurrentHashMap.newKeySet<String>()
 
     fun currentNetwork(): String = settings.network()
 
@@ -51,6 +55,12 @@ class WalletRepository(context: Context) {
     fun wallets(): List<WalletMeta> = metas.list()
 
     fun wallet(id: String): WalletMeta? = metas.list().firstOrNull { it.id == id }
+
+    fun rename(id: String, raw: String) {
+        val name = WalletName.normalize(raw)
+        if (wallet(id) == null) throw BdkUserException("지갑을 찾을 수 없습니다.")
+        metas.rename(id, name)
+    }
 
     fun setNetwork(network: String) {
         settings.setNetwork(network)
@@ -108,20 +118,44 @@ class WalletRepository(context: Context) {
         id
     }
 
-    suspend fun sync(id: String): SyncSnapshot = bdk {
-        val meta = requireMeta(id)
-        val session = session(meta)
-        val snapshot = BdkKit.sync(session, settings.esplora())
-        metas.updateBalance(id, snapshot.balanceSats)
-        snapshot
+    suspend fun sync(id: String): SyncSnapshot {
+        val session = bdkWallet(id) {
+            if (id in removed) throw CancellationException()
+            if (!scanning.add(id)) throw BdkUserException(ALREADY_SYNCING)
+            try {
+                session(requireMeta(id))
+            } catch (e: Exception) {
+                scanning.remove(id)
+                throw e
+            }
+        }
+        val url = esploraFor(requireMeta(id))
+        return try {
+            bdkWithin(SYNC_TIMEOUT_MS) {
+                val snapshot = try {
+                    BdkKit.sync(session, url)
+                } catch (e: Exception) {
+                    finishScan(id)
+                    throw e
+                }
+                workers.withLock(id) {
+                    if (id !in removed) metas.updateBalance(id, snapshot.balanceSats, operatingNetwork(requireMeta(id).network))
+                    scanning.remove(id)
+                    if (id in removed) cleanupLocked(id)
+                }
+                snapshot
+            }
+        } catch (e: TimeoutException) {
+            throw BdkUserException("탐색 서버 응답이 너무 오래 걸립니다.", e)
+        }
     }
 
-    suspend fun localSnapshot(id: String): SyncSnapshot = bdk {
+    suspend fun localSnapshot(id: String): SyncSnapshot = bdkWallet(id) {
         val meta = requireMeta(id)
         BdkKit.snapshot(session(meta), 0)
     }
 
-    suspend fun revealNext(id: String): String = bdk {
+    suspend fun revealNext(id: String): String = bdkWallet(id) {
         BdkKit.revealNext(session(requireMeta(id)))
     }
 
@@ -132,7 +166,7 @@ class WalletRepository(context: Context) {
         destination: String,
         amountSats: Long?,
         feeRate: Long,
-    ): SendDraft = bdk {
+    ): SendDraft = bdkWallet(id) {
         val meta = requireMeta(id)
         if (meta.kind == BdkKit.KIND_WATCH) throw BdkUserException("조회 전용 지갑은 보낼 수 없습니다.")
         BdkKit.buildSend(
@@ -145,19 +179,19 @@ class WalletRepository(context: Context) {
         )
     }
 
-    suspend fun signAndBroadcast(id: String, draft: SendDraft): String = bdk {
+    suspend fun signAndBroadcast(id: String, draft: SendDraft): String = bdkWallet(id) {
         val meta = requireMeta(id)
         val secret = secrets.read(id) ?: throw BdkUserException("이 기기에 서명 키가 없습니다.")
         if (secret.kind != meta.kind) throw BdkUserException("저장된 키 종류가 지갑과 맞지 않습니다.")
-        BdkKit.sign(draft, secret.kind, secret.value, BdkKit.networkOf(meta.network))
-        BdkKit.broadcast(settings.esplora(), draft.psbt)
+        BdkKit.sign(draft, secret.kind, secret.value, BdkKit.networkOf(operatingNetwork(meta.network)))
+        BdkKit.broadcast(esploraFor(meta), draft.psbt)
     }
 
-    suspend fun delete(id: String) = bdk {
-        sessions.remove(id)?.close()
+    suspend fun delete(id: String) = bdkWallet(id) {
+        removed.add(id)
         secrets.delete(id)
         metas.delete(id)
-        File(appContext.filesDir, "wallets/$id").deleteRecursively()
+        if (id !in scanning) cleanupLocked(id)
     }
 
     fun hasSecret(id: String): Boolean = secrets.read(id) != null
@@ -185,15 +219,40 @@ class WalletRepository(context: Context) {
         return id
     }
 
+    fun operatingNetwork(stored: String): String {
+        val active = settings.network()
+        val mainStyle = stored == NetworkDefaults.BITCOIN || stored == NetworkDefaults.BTCMOBICK
+        val activeMainStyle = active == NetworkDefaults.BITCOIN || active == NetworkDefaults.BTCMOBICK
+        return if (mainStyle && activeMainStyle) active else stored
+    }
+
+    fun balanceOnActiveChain(meta: WalletMeta): Long? {
+        val recorded = meta.balanceNetwork ?: meta.network
+        return if (recorded == operatingNetwork(meta.network)) meta.lastBalanceSats else null
+    }
+
     private fun session(meta: WalletMeta): BdkSession {
-        sessions[meta.id]?.let { return it }
+        val chain = operatingNetwork(meta.network)
+        val cached = sessions[meta.id]
+        if (cached != null) {
+            if (cached.chain == chain || meta.id in scanning) return cached
+            cached.close()
+            sessions.remove(meta.id)
+        }
         val opened = BdkKit.open(
             PublicDescriptors(meta.externalDescriptor, meta.internalDescriptor),
-            BdkKit.networkOf(meta.network),
+            BdkKit.networkOf(chain),
             dbPath(meta.id),
+            BdkKit.genesisHex(chain),
+            chain,
         )
         sessions[meta.id] = opened
         return opened
+    }
+
+    private fun esploraFor(meta: WalletMeta): String {
+        val chain = operatingNetwork(meta.network)
+        return if (settings.network() == chain) settings.esplora() else NetworkDefaults.defaultEsplora(chain)
     }
 
     private fun dbPath(id: String): String {
@@ -210,12 +269,46 @@ class WalletRepository(context: Context) {
         val index = metas.list().size + 1
         val prefix = when (kind) {
             BdkKit.KIND_WATCH -> "조회"
-            else -> if (networkName == NetworkDefaults.BITCOIN) "메인넷" else "시그넷"
+            else -> when (networkName) {
+                NetworkDefaults.BITCOIN -> "BTC"
+                NetworkDefaults.BTCMOBICK -> "BTCMobick"
+                else -> "BTC 시그넷"
+            }
         }
         return "$prefix 지갑 $index"
     }
 
-    private suspend fun <T> bdk(block: () -> T): T = withContext(dispatcher) { block() }
+    private fun finishScan(id: String) {
+        workers.withLock(id) {
+            scanning.remove(id)
+            if (id in removed) cleanupLocked(id)
+        }
+    }
+
+    private fun cleanupLocked(id: String) {
+        sessions.remove(id)?.close()
+        File(appContext.filesDir, "wallets/$id").deleteRecursively()
+        removed.remove(id)
+    }
+
+    private suspend fun <T> bdk(block: () -> T): T = withContext(Dispatchers.IO) { workers.call(block) }
+
+    private suspend fun <T> bdkWithin(timeoutMs: Long, block: () -> T): T = withContext(Dispatchers.IO) {
+        try {
+            workers.callWithin(timeoutMs, block)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw CancellationException("동기화가 중단되었습니다.", e)
+        }
+    }
+
+    private suspend fun <T> bdkWallet(id: String, block: () -> T): T =
+        withContext(Dispatchers.IO) { workers.callWallet(id, block) }
+
+    companion object {
+        const val ALREADY_SYNCING = "이미 동기화 중입니다."
+        private const val SYNC_TIMEOUT_MS = 20_000L
+    }
 }
 
 class SettingsStore(context: Context) {
@@ -223,8 +316,10 @@ class SettingsStore(context: Context) {
 
     fun network(): String = prefs.getString(KEY_NETWORK, NetworkDefaults.SIGNET) ?: NetworkDefaults.SIGNET
 
-    fun esplora(): String =
-        prefs.getString(KEY_ESPLORA, null) ?: NetworkDefaults.defaultEsplora(network())
+    fun esplora(): String {
+        val saved = prefs.getString(KEY_ESPLORA, null) ?: return NetworkDefaults.defaultEsplora(network())
+        return NetworkDefaults.preferredEsplora(network(), saved)
+    }
 
     fun setNetwork(network: String) {
         prefs.edit()
@@ -263,6 +358,7 @@ class MetaStore(context: Context) {
                         internalDescriptor = item.optString("internal").ifEmpty { null },
                         createdAt = item.getLong("createdAt"),
                         lastBalanceSats = if (item.has("balance") && !item.isNull("balance")) item.getLong("balance") else null,
+                        balanceNetwork = item.optString("balanceNetwork").ifEmpty { null },
                     ),
                 )
             }
@@ -276,8 +372,13 @@ class MetaStore(context: Context) {
     }
 
     @Synchronized
-    fun updateBalance(id: String, balance: Long) {
-        write(list().map { if (it.id == id) it.copy(lastBalanceSats = balance) else it })
+    fun updateBalance(id: String, balance: Long, chain: String) {
+        write(list().map { if (it.id == id) it.copy(lastBalanceSats = balance, balanceNetwork = chain) else it })
+    }
+
+    @Synchronized
+    fun rename(id: String, name: String) {
+        write(list().map { if (it.id == id) it.copy(name = name) else it })
     }
 
     @Synchronized
@@ -297,7 +398,8 @@ class MetaStore(context: Context) {
                     .put("external", meta.externalDescriptor)
                     .put("internal", meta.internalDescriptor ?: JSONObject.NULL)
                     .put("createdAt", meta.createdAt)
-                    .put("balance", meta.lastBalanceSats ?: JSONObject.NULL),
+                    .put("balance", meta.lastBalanceSats ?: JSONObject.NULL)
+                    .put("balanceNetwork", meta.balanceNetwork ?: JSONObject.NULL)
             )
         }
         prefs.edit().putString(KEY, array.toString()).commit()

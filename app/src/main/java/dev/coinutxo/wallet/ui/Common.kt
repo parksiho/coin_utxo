@@ -4,19 +4,25 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.view.WindowManager
+import androidx.compose.foundation.clickable
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import dev.coinutxo.bdk.BdkKit
+import dev.coinutxo.logic.AmountFormat
 import dev.coinutxo.logic.NetworkDefaults
-import java.math.BigDecimal
-import java.util.Locale
 
 private val Orange = Color(0xFFF7931A)
 private val Ink = Color(0xFF1C140C)
@@ -87,16 +93,35 @@ private fun Context.findActivity(): Activity? {
     return null
 }
 
-fun formatSats(sats: Long): String {
-    val grouped = "%,d".format(Locale.KOREA, sats)
-    val btc = BigDecimal.valueOf(sats).movePointLeft(8).stripTrailingZeros().toPlainString()
-    return "$grouped sats · $btc BTC"
+object ShownAmount {
+    var asSats by mutableStateOf(false)
+
+    fun toggle() {
+        asSats = !asSats
+    }
+}
+
+@Composable
+fun shownAmount(sats: Long, ticker: String = "BTC"): String =
+    if (ShownAmount.asSats) AmountFormat.sats(sats) else AmountFormat.btc(sats, ticker)
+
+@Composable
+fun AmountText(
+    sats: Long,
+    modifier: Modifier = Modifier,
+    style: TextStyle = MaterialTheme.typography.bodyLarge,
+    ticker: String = "BTC",
+) {
+    Text(shownAmount(sats, ticker), modifier = modifier.clickable { ShownAmount.toggle() }, style = style)
 }
 
 fun networkLabel(network: String): String = when (network) {
-    NetworkDefaults.BITCOIN -> "메인넷"
-    else -> "시그넷"
+    NetworkDefaults.BITCOIN -> "BTC"
+    NetworkDefaults.BTCMOBICK -> "BTCMobick"
+    else -> "BTC 시그넷"
 }
+
+fun amountTicker(network: String): String = if (network == NetworkDefaults.BTCMOBICK) "BMB" else "BTC"
 
 fun kindLabel(kind: String): String = when (kind) {
     BdkKit.KIND_MNEMONIC -> "니모닉"
@@ -114,5 +139,8 @@ fun safeError(error: Throwable): String {
     return message
 }
 
-fun explorerTxUrl(network: String, txid: String): String =
-    if (network == NetworkDefaults.BITCOIN) "https://mempool.space/tx/$txid" else "https://mempool.space/signet/tx/$txid"
+fun explorerTxUrl(network: String, txid: String): String = when (network) {
+    NetworkDefaults.BITCOIN -> "https://mempool.space/tx/$txid"
+    NetworkDefaults.BTCMOBICK -> "https://blockchain.mobick.info/tx/$txid"
+    else -> "https://mempool.space/signet/tx/$txid"
+}

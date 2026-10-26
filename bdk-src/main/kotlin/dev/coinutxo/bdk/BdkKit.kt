@@ -2,6 +2,8 @@ package dev.coinutxo.bdk
 
 import dev.coinutxo.logic.Bip21Parser
 import dev.coinutxo.logic.CoinControl
+import dev.coinutxo.logic.EsploraProbe
+import dev.coinutxo.logic.EsploraUnreachableException
 import dev.coinutxo.logic.ExtendedPubKey
 import dev.coinutxo.logic.FeeMath
 import dev.coinutxo.logic.NetworkDefaults
@@ -9,13 +11,16 @@ import dev.coinutxo.logic.PsbtInputs
 import dev.coinutxo.logic.UtxoRef
 import org.bitcoindevkit.Address
 import org.bitcoindevkit.Amount
+import org.bitcoindevkit.BlockHash
 import org.bitcoindevkit.ChainPosition
+import org.bitcoindevkit.CreateParams
 import org.bitcoindevkit.Descriptor
 import org.bitcoindevkit.DescriptorPublicKey
 import org.bitcoindevkit.DescriptorSecretKey
 import org.bitcoindevkit.EsploraClient
 import org.bitcoindevkit.FeeRate
 import org.bitcoindevkit.KeychainKind
+import org.bitcoindevkit.LoadParams
 import org.bitcoindevkit.Mnemonic
 import org.bitcoindevkit.Network
 import org.bitcoindevkit.NetworkKind
@@ -43,12 +48,20 @@ data class ImportedSecret(
     val descriptors: PublicDescriptors,
 )
 
+data class CoinActivity(
+    val txid: String,
+    val netSats: Long,
+    val confirmations: Int,
+    val timeSeconds: Long?,
+)
+
 data class SyncSnapshot(
     val balanceSats: Long,
     val tipHeight: Int,
     val utxos: List<UtxoRef>,
     val receiveAddress: String,
     val canRevealNext: Boolean,
+    val activities: List<CoinActivity>,
 )
 
 data class SendDraft(
@@ -66,6 +79,7 @@ class BdkSession(
     val persister: Persister?,
     val descriptors: PublicDescriptors,
     val network: Network,
+    val chain: String = "",
 ) : AutoCloseable {
     override fun close() {
         wallet?.close()
@@ -74,13 +88,22 @@ class BdkSession(
 }
 
 object BdkKit {
+    const val CHAIN_DATA_FAILURE = "체인 데이터를 가져오지 못했습니다."
     const val KIND_MNEMONIC = "MNEMONIC"
     const val KIND_WIF = "WIF"
     const val KIND_WATCH = "WATCH"
     const val ADDRESS_PREFIX = "address:"
+    const val BITCOIN_GENESIS = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+    const val MOBICK_GENESIS = "000000002f614682b2b4014d4948eeccf606221496572b2e7e6864404c36a163"
+
+    fun genesisHex(networkName: String): String? = when (networkName) {
+        NetworkDefaults.BITCOIN -> BITCOIN_GENESIS
+        NetworkDefaults.BTCMOBICK -> MOBICK_GENESIS
+        else -> null
+    }
 
     fun networkOf(name: String): Network = when (name) {
-        NetworkDefaults.BITCOIN -> Network.BITCOIN
+        NetworkDefaults.BITCOIN, NetworkDefaults.BTCMOBICK -> Network.BITCOIN
         NetworkDefaults.SIGNET -> Network.SIGNET
         else -> throw BdkUserException("지원하지 않는 네트워크입니다.")
     }
@@ -193,39 +216,98 @@ object BdkKit {
     fun singleAddress(descriptors: PublicDescriptors): String? =
         descriptors.external.removePrefix(ADDRESS_PREFIX).takeIf { descriptors.external.startsWith(ADDRESS_PREFIX) }
 
-    fun open(descriptors: PublicDescriptors, network: Network, sqlitePath: String): BdkSession {
+    fun open(
+        descriptors: PublicDescriptors,
+        network: Network,
+        sqlitePath: String,
+        genesisHash: String? = null,
+        chain: String = "",
+    ): BdkSession {
         if (singleAddress(descriptors) != null) {
-            return BdkSession(null, null, descriptors, network)
+            return BdkSession(null, null, descriptors, network, chain)
         }
         val kind = networkKind(network)
         val external = Descriptor(descriptors.external, kind)
         val internal = descriptors.internal?.let { Descriptor(it, kind) }
         val file = File(sqlitePath)
         if (file.exists()) {
-            try {
-                val persister = Persister.newSqlite(sqlitePath)
-                val wallet = if (internal == null) {
-                    Wallet.loadSingle(external, persister, 25u)
-                } else {
-                    Wallet.load(external, internal, persister, 25u)
-                }
-                return BdkSession(wallet, persister, descriptors, network)
-            } catch (_: Exception) {
-                file.delete()
+            loadExisting(file, external, internal, network, genesisHash, descriptors, chain)?.let { return it }
+        }
+        return createNew(file, external, internal, network, genesisHash, descriptors, chain)
+    }
+
+    private fun loadExisting(
+        file: File,
+        external: Descriptor,
+        internal: Descriptor?,
+        network: Network,
+        genesisHash: String?,
+        descriptors: PublicDescriptors,
+        chain: String,
+    ): BdkSession? {
+        val persister = try {
+            Persister.newSqlite(file.absolutePath)
+        } catch (_: Exception) {
+            file.delete()
+            return null
+        }
+        return try {
+            val wallet = openWallet(external, internal, network, persister, genesisHash, create = false)
+            BdkSession(wallet, persister, descriptors, network, chain)
+        } catch (_: Exception) {
+            runCatching { persister.close() }
+            file.delete()
+            null
+        }
+    }
+
+    private fun createNew(
+        file: File,
+        external: Descriptor,
+        internal: Descriptor?,
+        network: Network,
+        genesisHash: String?,
+        descriptors: PublicDescriptors,
+        chain: String,
+    ): BdkSession {
+        file.parentFile?.mkdirs()
+        val persister = Persister.newSqlite(file.absolutePath)
+        val wallet = openWallet(external, internal, network, persister, genesisHash, create = true)
+        wallet.persist(persister)
+        return BdkSession(wallet, persister, descriptors, network, chain)
+    }
+
+    private fun openWallet(
+        external: Descriptor,
+        internal: Descriptor?,
+        network: Network,
+        persister: Persister,
+        genesisHash: String?,
+        create: Boolean,
+    ): Wallet {
+        if (genesisHash == null) {
+            return if (create) {
+                if (internal == null) Wallet.createSingle(external, network, persister, 25u)
+                else Wallet(external, internal, network, persister, 25u)
+            } else {
+                if (internal == null) Wallet.loadSingle(external, persister, 25u)
+                else Wallet.load(external, internal, persister, 25u)
             }
         }
-        file.parentFile?.mkdirs()
-        val persister = Persister.newSqlite(sqlitePath)
-        val wallet = if (internal == null) {
-            Wallet.createSingle(external, network, persister, 25u)
+        val hash = BlockHash.fromString(genesisHash)
+        return if (create) {
+            val params = CreateParams(hash, 25u, true)
+            if (internal == null) Wallet.createSingleWithParams(external, network, persister, params)
+            else Wallet.createWithParams(external, internal, network, persister, params)
         } else {
-            Wallet(external, internal, network, persister, 25u)
+            val params = LoadParams(network, hash, 25u, true)
+            if (internal == null) Wallet.loadSingleWithParams(external, persister, params)
+            else Wallet.loadWithParams(external, internal, persister, params)
         }
-        wallet.persist(persister)
-        return BdkSession(wallet, persister, descriptors, network)
     }
 
     fun sync(session: BdkSession, esploraUrl: String): SyncSnapshot {
+        probe(esploraUrl)
         val watched = singleAddress(session.descriptors)
         if (watched != null) return syncSingleAddress(session, esploraUrl, watched)
         val wallet = session.wallet ?: throw BdkUserException("지갑을 열지 못했습니다.")
@@ -240,7 +322,7 @@ object BdkKit {
         } catch (e: BdkUserException) {
             throw e
         } catch (e: Exception) {
-            throw BdkUserException("체인 데이터를 가져오지 못했습니다.", e)
+            throw BdkUserException(CHAIN_DATA_FAILURE, e)
         } finally {
             client.close()
         }
@@ -255,6 +337,16 @@ object BdkKit {
             val seen = linkedSetOf<String>()
             var after: org.bitcoindevkit.Txid? = null
             val utxos = mutableListOf<UtxoRef>()
+            val activityNets = linkedMapOf<String, Long>()
+            val activityConf = hashMapOf<String, Int>()
+            val activityTime = hashMapOf<String, Long?>()
+            fun note(id: String, delta: Long, confirmations: Int, time: Long?) {
+                activityNets[id] = (activityNets[id] ?: 0L) + delta
+                activityConf[id] = maxOf(activityConf[id] ?: 0, confirmations)
+                val known = activityTime[id]
+                if (time != null && (known == null || time > known)) activityTime[id] = time
+                else if (id !in activityTime) activityTime[id] = null
+            }
             repeat(8) {
                 val page = client.getAddressTxs(address, after)
                 if (page.isEmpty()) return@repeat
@@ -264,15 +356,28 @@ object BdkKit {
                     if (!seen.add(txid)) continue
                     fresh++
                     val tx = client.getTx(meta.txid) ?: continue
+                    val txConf = confirmations(meta.status, tip)
+                    val txTime = meta.status.blockTime?.toLong()
                     tx.output().forEachIndexed { index, output ->
                         if (!output.scriptPubkey.toBytes().contentEquals(wanted)) return@forEachIndexed
+                        val amount = output.value.toSat().toLong()
+                        note(txid, amount, txConf, txTime)
                         val status = client.getOutputStatus(meta.txid, index.toULong())
+                        val spender = status?.txid?.toString()?.lowercase()
+                        if (status?.spent == true && spender != null) {
+                            note(
+                                spender,
+                                -amount,
+                                status.status?.let { confirmations(it, tip) } ?: 0,
+                                status.status?.blockTime?.toLong(),
+                            )
+                        }
                         if (status?.spent == true) return@forEachIndexed
                         utxos += UtxoRef(
                             txid = txid,
                             vout = index,
-                            amountSats = output.value.toSat().toLong(),
-                            confirmations = confirmations(meta.status, tip),
+                            amountSats = amount,
+                            confirmations = txConf,
                         )
                     }
                 }
@@ -286,6 +391,7 @@ object BdkKit {
                 utxos = utxos,
                 receiveAddress = address.toString(),
                 canRevealNext = false,
+                activities = sortActivities(activityNets, activityConf, activityTime),
             )
         } catch (e: BdkUserException) {
             throw e
@@ -299,7 +405,7 @@ object BdkKit {
     fun snapshot(session: BdkSession, tipHeight: Int): SyncSnapshot {
         val watched = singleAddress(session.descriptors)
         if (watched != null) {
-            return SyncSnapshot(0L, tipHeight, emptyList(), watched, false)
+            return SyncSnapshot(0L, tipHeight, emptyList(), watched, false, emptyList())
         }
         val wallet = session.wallet ?: throw BdkUserException("지갑을 열지 못했습니다.")
         val balance = wallet.balance().total.toSat().toLong()
@@ -320,8 +426,41 @@ object BdkKit {
             utxos = utxos,
             receiveAddress = receiveAddress(session),
             canRevealNext = canReveal(session),
+            activities = activitiesOf(wallet, tipHeight),
         )
     }
+
+    private fun activitiesOf(wallet: Wallet, tipHeight: Int): List<CoinActivity> {
+        val nets = linkedMapOf<String, Long>()
+        val confs = hashMapOf<String, Int>()
+        val times = hashMapOf<String, Long?>()
+        for (item in wallet.transactions()) {
+            val values = wallet.sentAndReceived(item.transaction)
+            val net = values.received.toSat().toLong() - values.sent.toSat().toLong()
+            val txid = item.transaction.computeTxid().toString().lowercase()
+            val time = when (val position = item.chainPosition) {
+                is ChainPosition.Confirmed -> position.confirmationBlockTime.confirmationTime.toLong()
+                is ChainPosition.Unconfirmed -> position.timestamp?.toLong()
+            }
+            nets[txid] = net
+            confs[txid] = confirmations(item.chainPosition, tipHeight)
+            times[txid] = time
+        }
+        return sortActivities(nets, confs, times)
+    }
+
+    private fun sortActivities(
+        nets: Map<String, Long>,
+        confs: Map<String, Int>,
+        times: Map<String, Long?>,
+    ): List<CoinActivity> = nets.map { (txid, net) ->
+        CoinActivity(
+            txid = txid,
+            netSats = net,
+            confirmations = confs[txid] ?: 0,
+            timeSeconds = times[txid],
+        )
+    }.sortedWith(compareByDescending<CoinActivity> { it.confirmations == 0 }.thenByDescending { it.timeSeconds ?: 0L })
 
     fun revealNext(session: BdkSession): String {
         if (!canReveal(session)) throw BdkUserException("이 지갑은 주소를 더 만들 수 없습니다.")
@@ -451,6 +590,7 @@ object BdkKit {
     }
 
     fun broadcast(esploraUrl: String, psbt: Psbt): String {
+        probe(esploraUrl)
         val tx: Transaction = try {
             psbt.extractTx()
         } catch (e: Exception) {
@@ -465,6 +605,14 @@ object BdkKit {
             client.close()
         }
         return tx.computeTxid().toString()
+    }
+
+    private fun probe(esploraUrl: String) {
+        try {
+            EsploraProbe.assertReachable(esploraUrl)
+        } catch (e: EsploraUnreachableException) {
+            throw BdkUserException(e.message ?: "탐색 서버에 연결하지 못했습니다.", e)
+        }
     }
 
     private fun signOptions(): SignOptions = SignOptions(
