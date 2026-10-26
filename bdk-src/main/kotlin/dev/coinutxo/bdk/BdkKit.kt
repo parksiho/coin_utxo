@@ -232,7 +232,7 @@ object BdkKit {
         val persister = session.persister ?: throw BdkUserException("지갑을 열지 못했습니다.")
         val client = EsploraClient(esploraUrl, null)
         try {
-            val update = client.fullScan(wallet.startFullScan().build(), 20uL, 4uL)
+            val update = client.fullScan(wallet.startFullScan().build(), 20uL, 1uL)
             wallet.applyUpdate(update)
             wallet.persist(persister)
             val tip = client.getHeight().toInt()

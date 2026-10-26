@@ -146,7 +146,9 @@ fun WalletScreen(nav: NavHostController, id: String) {
                 Text(address, fontFamily = FontFamily.Monospace)
                 if (model.copied) Text("주소를 복사했습니다.")
                 OutlinedButton(onClick = { copyText(context, address); model.markCopied() }) { Text("주소 복사") }
-                Image(bitmap = remember(address) { qrBitmap(address) }, contentDescription = "받기 주소 QR", modifier = Modifier.height(220.dp))
+                remember(address) { qrBitmap(address) }?.let { qr ->
+                    Image(bitmap = qr, contentDescription = "받기 주소 QR", modifier = Modifier.height(220.dp))
+                }
             }
             Text("UTXO", style = MaterialTheme.typography.titleMedium)
             Text("보낼 때는 체크한 UTXO만 입력으로 사용합니다. 선택하지 않은 코인은 거래에 넣지 않습니다.")
@@ -212,15 +214,21 @@ private fun copyText(context: Context, value: String) {
     clipboard.setPrimaryClip(ClipData.newPlainText("address", value))
 }
 
-private fun qrBitmap(text: String, size: Int = 512): androidx.compose.ui.graphics.ImageBitmap {
-    val matrix = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, size, size)
-    val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-    for (x in 0 until size) {
-        for (y in 0 until size) {
-            bitmap.setPixel(x, y, if (matrix.get(x, y)) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+private fun qrBitmap(text: String, size: Int = 512): androidx.compose.ui.graphics.ImageBitmap? {
+    return try {
+        val matrix = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, size, size)
+        val width = matrix.width
+        val height = matrix.height
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        for (x in 0 until width) {
+            for (y in 0 until height) {
+                bitmap.setPixel(x, y, if (matrix.get(x, y)) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+            }
         }
+        bitmap.asImageBitmap()
+    } catch (_: Exception) {
+        null
     }
-    return bitmap.asImageBitmap()
 }
 
 class WalletViewModel(app: Application, private val walletId: String) : AndroidViewModel(app) {

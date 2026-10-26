@@ -92,10 +92,9 @@ class WalletRepository(context: Context) {
     suspend fun importWatch(text: String): String = bdk {
         val networkName = settings.network()
         val descriptors = BdkKit.importWatch(text, BdkKit.networkOf(networkName))
-        val id = newId(BdkKit.KIND_WATCH, networkName)
-        metas.add(
+        commitWallet(
             WalletMeta(
-                id = id,
+                id = newId(BdkKit.KIND_WATCH, networkName),
                 name = defaultName(BdkKit.KIND_WATCH, networkName),
                 network = networkName,
                 kind = BdkKit.KIND_WATCH,
@@ -104,8 +103,22 @@ class WalletRepository(context: Context) {
                 createdAt = System.currentTimeMillis(),
                 lastBalanceSats = null,
             ),
+            keepSecret = false,
         )
-        id
+    }
+
+    private fun commitWallet(meta: WalletMeta, keepSecret: Boolean): String {
+        metas.add(meta)
+        try {
+            session(meta)
+        } catch (e: Exception) {
+            sessions.remove(meta.id)?.close()
+            if (keepSecret) secrets.delete(meta.id)
+            metas.delete(meta.id)
+            File(appContext.filesDir, "wallets/${meta.id}").deleteRecursively()
+            throw e
+        }
+        return meta.id
     }
 
     suspend fun sync(id: String): SyncSnapshot = bdk {
@@ -168,21 +181,18 @@ class WalletRepository(context: Context) {
         descriptors: PublicDescriptors,
         networkName: String,
     ): String {
-        val id = newId(kind, networkName)
-        if (kind == BdkKit.KIND_MNEMONIC) secrets.putMnemonic(id, secret) else secrets.putWif(id, secret)
-        metas.add(
-            WalletMeta(
-                id = id,
-                name = defaultName(kind, networkName),
-                network = networkName,
-                kind = kind,
-                externalDescriptor = descriptors.external,
-                internalDescriptor = descriptors.internal,
-                createdAt = System.currentTimeMillis(),
-                lastBalanceSats = null,
-            ),
+        val meta = WalletMeta(
+            id = newId(kind, networkName),
+            name = defaultName(kind, networkName),
+            network = networkName,
+            kind = kind,
+            externalDescriptor = descriptors.external,
+            internalDescriptor = descriptors.internal,
+            createdAt = System.currentTimeMillis(),
+            lastBalanceSats = null,
         )
-        return id
+        if (kind == BdkKit.KIND_MNEMONIC) secrets.putMnemonic(meta.id, secret) else secrets.putWif(meta.id, secret)
+        return commitWallet(meta, keepSecret = true)
     }
 
     private fun session(meta: WalletMeta): BdkSession {

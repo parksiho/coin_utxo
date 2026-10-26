@@ -1,6 +1,7 @@
 package dev.coinutxo.wallet.ui
 
 import android.app.Application
+import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -31,16 +32,21 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.navigation.NavHostController
 import dev.coinutxo.logic.NetworkDefaults
 import dev.coinutxo.wallet.CoinUtxoApplication
 import dev.coinutxo.wallet.data.WalletMeta
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 
 private fun AndroidViewModel.repo() = getApplication<CoinUtxoApplication>().repository
@@ -176,10 +182,24 @@ data class SettingsState(
     val error: String?,
 )
 
+@Composable
+private fun createWalletModel(): CreateWalletViewModel {
+    val activity = LocalContext.current.findActivity() as ComponentActivity
+    return viewModel(
+        viewModelStoreOwner = activity,
+        key = "create-wallet",
+        factory = viewModelFactory {
+            initializer { CreateWalletViewModel(activity.application) }
+        },
+    )
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun CreateBackupScreen(nav: NavHostController, model: CreateWalletViewModel = viewModel()) {
+fun CreateBackupScreen(nav: NavHostController) {
+    val model = createWalletModel()
     SecureScreenEffect()
+    LaunchedEffect(Unit) { model.ensureGenerated() }
     val state = model.state
     Scaffold(topBar = { TopAppBar(title = { Text("복구 문구") }, navigationIcon = {
         TextButton(onClick = { nav.popBackStack() }) { Text("뒤로") }
@@ -206,12 +226,25 @@ fun CreateBackupScreen(nav: NavHostController, model: CreateWalletViewModel = vi
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun CreateConfirmScreen(nav: NavHostController, model: CreateWalletViewModel = viewModel()) {
+fun CreateConfirmScreen(nav: NavHostController) {
+    val model = createWalletModel()
     SecureScreenEffect()
     val state = model.state
     var first by remember { mutableStateOf("") }
     var second by remember { mutableStateOf("") }
+    var navigateError by remember { mutableStateOf<String?>(null) }
     val ready = state as? CreateState.Ready
+    LaunchedEffect(model.savedId) {
+        val id = model.savedId ?: return@LaunchedEffect
+        try {
+            nav.navigate("wallet/$id") { popUpTo("home") }
+            model.consumeSaved()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            navigateError = safeError(e)
+        }
+    }
     Scaffold(topBar = { TopAppBar(title = { Text("단어 확인") }, navigationIcon = {
         TextButton(onClick = { nav.popBackStack() }) { Text("뒤로") }
     }) }) { padding ->
@@ -236,12 +269,9 @@ fun CreateConfirmScreen(nav: NavHostController, model: CreateWalletViewModel = v
                 modifier = Modifier.fillMaxWidth(),
             )
             ready.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            navigateError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             Button(
-                onClick = {
-                    model.confirm(first, second) { id ->
-                        nav.navigate("wallet/$id") { popUpTo("home") }
-                    }
-                },
+                onClick = { model.confirm(first, second) },
                 enabled = !ready.saving && first.isNotBlank() && second.isNotBlank(),
                 modifier = Modifier.fillMaxWidth(),
             ) { Text(if (ready.saving) "저장 중" else "지갑 저장") }
@@ -262,25 +292,40 @@ sealed interface CreateState {
 
 class CreateWalletViewModel(app: Application) : AndroidViewModel(app) {
     private var secret: List<CharArray>? = null
+    private var started = false
     var state by mutableStateOf<CreateState>(CreateState.Loading)
         private set
+    var savedId by mutableStateOf<String?>(null)
+        private set
 
-    init {
+    fun ensureGenerated() {
+        if (started || secret != null || savedId != null) return
+        started = true
         viewModelScope.launch {
+            var generated: List<CharArray>? = null
             try {
-                val generated = repo().newMnemonic()
-                secret = generated
+                generated = repo().newMnemonic()
+                ensureActive()
                 val picks = generated.indices.shuffled().take(2).sorted()
-                state = CreateState.Ready(generated.map { String(it) }, picks)
+                secret = generated
+                generated = null
+                state = CreateState.Ready(secret.orEmpty().map { String(it) }, picks)
+            } catch (e: CancellationException) {
+                generated?.forEach { it.fill('\u0000') }
+                started = secret != null
+                throw e
             } catch (e: Exception) {
+                generated?.forEach { it.fill('\u0000') }
+                started = false
                 state = CreateState.Failed(safeError(e))
             }
         }
     }
 
-    fun confirm(first: String, second: String, onSaved: (String) -> Unit) {
+    fun confirm(first: String, second: String) {
         val words = secret ?: return
         val ready = state as? CreateState.Ready ?: return
+        if (savedId != null || ready.saving) return
         val ok = matches(words, ready.picks[0], first) && matches(words, ready.picks[1], second)
         if (!ok) {
             state = ready.copy(error = "입력한 단어가 복구 문구와 일치하지 않습니다.")
@@ -290,11 +335,21 @@ class CreateWalletViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 val id = repo().saveMnemonic(words)
-                onSaved(id)
+                words.forEach { it.fill('\u0000') }
+                secret = null
+                savedId = id
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 state = ready.copy(saving = false, error = safeError(e))
             }
         }
+    }
+
+    fun consumeSaved() {
+        savedId = null
+        started = false
+        state = CreateState.Loading
     }
 
     private fun matches(words: List<CharArray>, index: Int, entry: String): Boolean =
