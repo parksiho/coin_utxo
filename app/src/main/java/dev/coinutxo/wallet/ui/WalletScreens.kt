@@ -220,6 +220,16 @@ fun WalletScreen(nav: NavHostController, id: String) {
                     Text("팁 높이 ${snapshot.tipHeight}", style = MaterialTheme.typography.bodySmall)
                 }
             }
+            if (model.busy && snapshot != null) {
+                Text(
+                    if (model.shownNetwork == NetworkDefaults.BITCOIN || model.shownNetwork == NetworkDefaults.BTCMOBICK) {
+                        "받기 주소는 바로 쓸 수 있습니다. 처음 잔액을 맞출 때만 오래 걸립니다."
+                    } else {
+                        "받기 주소는 바로 쓸 수 있습니다. 잔액은 체인과 맞추는 중입니다."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("받기 주소", style = MaterialTheme.typography.titleMedium)
@@ -227,11 +237,13 @@ fun WalletScreen(nav: NavHostController, id: String) {
                 if (address.isNullOrBlank()) {
                     Text("주소를 아직 만들지 못했습니다.")
                 } else {
-                    Image(
-                        bitmap = remember(address) { qrBitmap(address) },
-                        contentDescription = "받기 주소 QR",
-                        modifier = Modifier.size(220.dp),
-                    )
+                    remember(address) { qrBitmap(address) }?.let { qr ->
+                        Image(
+                            bitmap = qr,
+                            contentDescription = "받기 주소 QR",
+                            modifier = Modifier.size(220.dp),
+                        )
+                    }
                     Text(
                         address,
                         fontFamily = FontFamily.Monospace,
@@ -399,15 +411,21 @@ private fun copyText(context: Context, value: String) {
     clipboard.setPrimaryClip(ClipData.newPlainText("address", value))
 }
 
-private fun qrBitmap(text: String, size: Int = 512): androidx.compose.ui.graphics.ImageBitmap {
-    val matrix = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, size, size)
-    val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-    for (x in 0 until size) {
-        for (y in 0 until size) {
-            bitmap.setPixel(x, y, if (matrix.get(x, y)) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+private fun qrBitmap(text: String, size: Int = 512): androidx.compose.ui.graphics.ImageBitmap? {
+    return try {
+        val matrix = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, size, size)
+        val width = matrix.width
+        val height = matrix.height
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        for (x in 0 until width) {
+            for (y in 0 until height) {
+                bitmap.setPixel(x, y, if (matrix.get(x, y)) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+            }
         }
+        bitmap.asImageBitmap()
+    } catch (_: Exception) {
+        null
     }
-    return bitmap.asImageBitmap()
 }
 
 class WalletViewModel(app: Application, private val walletId: String) : AndroidViewModel(app) {

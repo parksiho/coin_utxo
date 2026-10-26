@@ -93,6 +93,8 @@ object BdkKit {
     const val KIND_WIF = "WIF"
     const val KIND_WATCH = "WATCH"
     const val ADDRESS_PREFIX = "address:"
+    private const val SCAN_STOP_GAP = 20uL
+    private const val SCAN_PARALLEL = 5uL
     const val BITCOIN_GENESIS = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
     const val MOBICK_GENESIS = "000000002f614682b2b4014d4948eeccf606221496572b2e7e6864404c36a163"
 
@@ -314,7 +316,12 @@ object BdkKit {
         val persister = session.persister ?: throw BdkUserException("지갑을 열지 못했습니다.")
         val client = EsploraClient(esploraUrl, null)
         try {
-            val update = client.fullScan(wallet.startFullScan().build(), 20uL, 4uL)
+            val seenChain = wallet.latestCheckpoint().height > 0u
+            val update = if (seenChain) {
+                client.sync(wallet.startSyncWithRevealedSpks().build(), SCAN_PARALLEL)
+            } else {
+                client.fullScan(wallet.startFullScan().build(), SCAN_STOP_GAP, SCAN_PARALLEL)
+            }
             wallet.applyUpdate(update)
             wallet.persist(persister)
             val tip = client.getHeight().toInt()
