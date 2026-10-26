@@ -1,6 +1,8 @@
 .gradle/
 .kotlin/
 **/build/
+logic/bin/
+bdkcheck/bin/
 local.properties
 .idea/
 *.iml
